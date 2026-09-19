@@ -186,6 +186,11 @@ agent prompts and trust levels. Already have nodes running? Keeping them current
 — auto-upgrade and the manual re-install — is covered in
 [`docs/plugin-upgrade.md`](docs/plugin-upgrade.md).
 
+The plugin talks only to the Caura server you configure (`CAURA_API_URL`) and
+identifies itself on every request with
+`User-Agent: openclaw-plugin/<version> (node/<major>)`, which the server's
+self-hosted heartbeat uses to count connected plugin installs.
+
 ### Python client
 
 Talk to any managed or self-hosted Caura deployment from Python:
