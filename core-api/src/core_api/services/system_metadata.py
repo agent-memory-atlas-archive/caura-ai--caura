@@ -124,6 +124,72 @@ def set_system_value(
         metadata[key] = value
 
 
+def strip_platform_metadata(metadata: dict | None) -> dict | None:
+    """Caller-owned view of ``metadata``: the dual-write copies removed.
+
+    ax-0917-h-04. ``set_system_value`` writes every platform value TWICE (the
+    legacy top-level key plus ``_system``), and the read side derives a THIRD
+    copy into ``MemoryOut.system_metadata`` — so a recall row shipped the same
+    ``llm_ms`` / ``write_latency_ms`` / ``semantic_dedup_ms`` / ``weight_source``
+    block three times, ~1.9 KB per row against 65-82 B of actual content.
+
+    This picks ONE location for agent-facing reads. ``system_metadata`` is the
+    one that survives: it is the documented C25 read surface, it is the merged
+    view (nested wins over legacy) so it is correct for historical rows too, and
+    ``MemoryOut.metadata``'s own docstring already says reading platform keys
+    from ``metadata`` is deprecated. NOTHING is deleted — the JSONB column is
+    untouched, ``system_metadata`` carries the same values in the same response,
+    and the detail read (``GET /memories/{id}``) still returns raw ``metadata``.
+
+    ``summary`` and ``tags`` are ``CALLER_OWNABLE_KEYS``, and the read side CAN
+    tell the two apart — which is why they are no longer kept unconditionally.
+    ``set_system_value`` writes the top-level mirror for every platform value
+    EXCEPT one whose key the caller owns, so the two cases separate cleanly at
+    read time:
+
+    * caller supplied it  -> the platform skipped the top-level write, so
+      ``metadata[key]`` is the caller's value and ``_system[key]`` is the
+      platform's. They DIFFER, and the caller's copy is kept.
+    * platform produced it -> both writes happened, so ``metadata[key]`` and
+      ``_system[key]`` are IDENTICAL. That is a mirror, not caller data, and it
+      is dropped like any other platform key.
+
+    Keeping them unconditionally made the docstring's "one location" claim false
+    for these two keys: a platform-produced ``summary`` was still shipped twice
+    (top level + the merged ``system_metadata`` view), just 2x instead of 3x.
+
+    Equality is the proxy, and it has one accepted false positive: a caller who
+    writes a value byte-identical to the platform's loses the top-level copy.
+    That is not data loss on the wire — ``system_metadata`` carries the same
+    value in the same response — and it is strictly better than shipping every
+    platform-produced summary twice to protect a coincidence.
+
+    A key with NO ``_system`` counterpart is always kept. Historical (pre-C25)
+    rows have no namespace to compare against, so a mirror cannot be proven, and
+    an unprovable case must not be dropped — that is the clobber C25 exists to
+    prevent.
+
+    Only None-ness is preserved; a row left with nothing caller-owned returns
+    ``{}``, never None. That is the same falsy-``{}`` trap ``_dict_to_memory_out``
+    guards: ``null`` and ``{}`` are different answers on the wire, and a row that
+    HAS a metadata column should not report it absent just because every key in
+    it was platform-written.
+    """
+    if metadata is None:
+        return None
+    nested = metadata.get(SYSTEM_NAMESPACE) or {}
+    kept: dict = {}
+    for key, value in metadata.items():
+        if key in PLATFORM_ONLY_KEYS or key == SYSTEM_NAMESPACE:
+            continue
+        # Caller-ownable, and identical to the namespace copy => the platform
+        # wrote both, so this is the mirror rather than the caller's own value.
+        if key in CALLER_OWNABLE_KEYS and key in nested and nested[key] == value:
+            continue
+        kept[key] = value
+    return kept
+
+
 def extract_system_metadata(metadata: dict | None) -> dict | None:
     """Read-side view: ``_system`` merged over legacy top-level platform keys.
 

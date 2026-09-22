@@ -65,6 +65,7 @@ from core_api.schemas import (
     MemoryOut,
     MemoryUpdate,
     PaginatedMemoryResponse,
+    RecallRequest,
     RedistributeRequest,
     RedistributeResponse,
     SearchDiagnostic,
@@ -2027,6 +2028,203 @@ def _resolve_read_identity(auth: AuthContext, body: SearchRequest) -> tuple[Agen
     return eff_agent_id, identity_asserted
 
 
+# ax-0917-h-05 — a stable slug, same contract as SUCCESSOR_ENRICHMENT_INCOMPLETE.
+UNRECOGNIZED_PARAMETERS = "unrecognized_parameters"
+SUPERSEDED_PARAMETER_ALIAS = "superseded_parameter_alias"
+
+
+def _declared_alias_spellings(model: type[SearchRequest]) -> dict[str, tuple[str, tuple[str, ...]]]:
+    """Map every declared spelling of an aliased field to that field.
+
+    ``{alias -> (field_name, all spellings in priority order)}``. Built by
+    introspection rather than a hand-kept list, so a field that gains an alias
+    later cannot quietly start being reported as junk.
+    """
+    spellings: dict[str, tuple[str, tuple[str, ...]]] = {}
+    for name, field in model.model_fields.items():
+        alias = field.validation_alias
+        choices = getattr(alias, "choices", None)
+        if not choices:
+            continue
+        # ``AliasChoices.choices`` may hold alias PATHS (lists) for nested
+        # lookups; only flat string spellings can collide with an extra key.
+        flat = tuple(c for c in choices if isinstance(c, str))
+        for c in flat:
+            spellings[c] = (name, flat)
+    return spellings
+
+
+# Computed once per model: the classes are static, and this runs on every
+# search request. Keyed by class because ``RecallRequest`` subclasses
+# ``SearchRequest`` and may declare aliases of its own.
+_ALIAS_SPELLINGS_CACHE: dict[type, dict[str, tuple[str, tuple[str, ...]]]] = {}
+
+
+def _alias_spellings_for(model: type[SearchRequest]) -> dict[str, tuple[str, tuple[str, ...]]]:
+    cached = _ALIAS_SPELLINGS_CACHE.get(model)
+    if cached is None:
+        cached = _declared_alias_spellings(model)
+        _ALIAS_SPELLINGS_CACHE[model] = cached
+    return cached
+
+
+def _superseded_winner(choices: tuple[str, ...], extras: dict) -> str | None:
+    """Which spelling pydantic actually used — or None when that is unknowable.
+
+    ``AliasChoices`` resolution takes the FIRST choice present in the input, so
+    every other spelling the caller sent lands in ``model_extra``. Two facts
+    follow, and together they bound what can be inferred from ``extras`` alone:
+
+    * the winner outranks every loser, so it sits strictly above the
+      highest-priority spelling found in ``extras``;
+    * exactly one spelling above that point was sent — the winner — but
+      ``extras`` cannot say WHICH, because a spelling that was never sent is
+      absent from ``extras`` for the same reason a consumed one is.
+
+    So the answer is exact only when one candidate remains above the first
+    loser. With two spellings that is always the case. With three or more it
+    may not be: given ``("a", "b", "c")`` and a caller who sent only ``b`` and
+    ``c``, pydantic used ``b`` while ``a`` and ``b`` are indistinguishable from
+    here — and the earlier ``next(c for c in choices if c not in extras)``
+    answered ``a``, confidently and wrongly.
+
+    Returning None there is the honest answer; the caller is told the field was
+    superseded without being told a spelling it may never have sent. Naming it
+    exactly for N >= 3 needs the raw request keys (a ``mode="wrap"`` validator
+    recording them), which is not worth putting on this path for a case no
+    field currently has.
+    """
+    lost = [i for i, c in enumerate(choices) if c in extras]
+    if not lost:
+        return None
+    candidates = choices[: min(lost)]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+_MAX_REPORTED_UNKNOWN = 20
+
+
+def _unknown_param_warnings(body: SearchRequest, *, route: str) -> list[dict]:
+    """Report the request keys this surface accepted and then ignored.
+
+    ax-0917-h-05. The search/filter/query bodies accept unknown fields on
+    purpose (SAFE-01: a misspelled filter returns the wrong rows, not a wrong
+    write, and the permissiveness is a compatibility promise to integrators).
+    What was never deliberate is that the caller is told NOTHING: ``limit: 2``
+    and ``bogus_param_xyz: 2`` produced byte-identical responses to sending
+    neither, so an agent that asked for 2 rows got the default 5 and 3.5x the
+    payload with no signal anywhere that its parameter had not been read.
+
+    So the field survives (still 2xx, still no rejection) and the silence does
+    not. Two channels, because they answer to different people: a
+    ``logger.warning`` for the operator watching an integration, and an A28
+    ``warnings`` entry for the caller, which is the only one an autonomous agent
+    can act on — it does not read our logs.
+
+    Two kinds of key end up in ``model_extra``, and they need different answers.
+    A declared alias sent ALONE is absorbed and never reaches here — but a caller
+    who sends both spellings (``top_k`` and ``limit``, or ``status_filter`` and
+    ``status``) leaves the losing one behind, and it is a name this endpoint
+    knows. Reporting that as "not read by this endpoint" is false: it was read
+    and then superseded, and for ``status`` / ``memory_type`` it would send an
+    integrator looking for a typo that is not there. So the two are split, and
+    the alias case is named for what it is.
+
+    Capped at ``_MAX_REPORTED_UNKNOWN`` names. A caller that sends two hundred
+    junk keys should not get a warning bigger than the result set it asked
+    for — in a change whose whole point is payload size, an unbounded echo of
+    caller input would be its own bug.
+    """
+    extras = body.model_extra or {}
+    if not extras:
+        return []
+
+    # An extra key is not automatically an unknown one. ``extra="allow"`` keeps
+    # whatever pydantic did not bind, and when a caller sends BOTH spellings of
+    # an aliased field the losing spelling lands here even though it is a name
+    # this endpoint knows — it was read, then superseded. Calling that "not read
+    # by this endpoint" is simply false, and for ``status`` / ``memory_type`` it
+    # would send an integrator hunting a typo that does not exist.
+    alias_spellings = _alias_spellings_for(type(body))
+    superseded: list[tuple[str, str, str | None]] = []
+    unknown: list[str] = []
+    for key in sorted(extras):
+        entry = alias_spellings.get(key)
+        if entry is None:
+            unknown.append(key)
+            continue
+        field_name, choices = entry
+        # ``None`` when the winning spelling cannot be known from extras alone.
+        # The two cases get different sentences: naming a field where a reader
+        # expects a spelling would be its own small lie.
+        superseded.append((key, field_name, _superseded_winner(choices, extras)))
+
+    warnings: list[dict] = []
+
+    if superseded:
+        capped = superseded[:_MAX_REPORTED_UNKNOWN]
+        logger.warning(
+            "request sent two spellings of the same parameter",
+            extra={
+                "path": route,
+                "tenant_id": body.tenant_id,
+                "superseded_parameters": [k for k, _, _ in capped],
+            },
+        )
+        warnings.append(
+            {
+                "code": SUPERSEDED_PARAMETER_ALIAS,
+                "message": (
+                    "These request parameters are accepted aliases, but another "
+                    "spelling of the same field was also sent and won: "
+                    + ", ".join(
+                        f"'{k}' superseded by '{w}'"
+                        if w
+                        else f"'{k}' superseded by another spelling of '{f}'"
+                        for k, f, w in capped
+                    )
+                    + "."
+                ),
+                "details": {
+                    "superseded_parameters": {k: f for k, f, _ in capped},
+                    # The spelling that won, where it is knowable. Absent for an
+                    # alias whose winner cannot be identified from the request.
+                    "superseded_by": {k: w for k, _, w in capped if w},
+                },
+            }
+        )
+
+    if unknown:
+        capped_unknown = unknown[:_MAX_REPORTED_UNKNOWN]
+        logger.warning(
+            "request carried parameters this route does not read",
+            extra={
+                "path": route,
+                "tenant_id": body.tenant_id,
+                "unknown_parameters": capped_unknown,
+            },
+        )
+        # No result-count sentence here. ``limit`` is a DECLARED alias of
+        # ``top_k``: sent alone it is absorbed and never reaches this branch,
+        # sent alongside ``top_k`` it is reported as superseded above. So the
+        # count hint could only ever be attached to keys it has nothing to do
+        # with — it was accurate when ``limit`` was genuinely unread, and the
+        # alias is what made it unreachable.
+        warnings.append(
+            {
+                "code": UNRECOGNIZED_PARAMETERS,
+                "message": (
+                    "These request parameters are not read by this endpoint and had no effect: "
+                    + ", ".join(capped_unknown)
+                    + "."
+                ),
+                "details": {"unknown_parameters": capped_unknown},
+            }
+        )
+
+    return warnings
+
+
 @router.post("/search", response_model=SearchResponse)
 @search_limit
 async def search(
@@ -2092,7 +2290,10 @@ async def _search_inner(
     recall_ctx: dict = {}
     # A28 — always collected (no request flag gates it); only serialized below
     # when a step actually put something in it.
-    search_warnings: list = []
+    # ax-0917-h-05 seeds it with any parameter the body carried and this route
+    # does not read — the same silent-drop that hid ``limit`` on /recall is live
+    # on /search, which shares this body.
+    search_warnings: list = _unknown_param_warnings(body, route="memory-search")
     try:
         config = await resolve_config(body.tenant_id)
         # Widen the read predicate when the caller authenticated with
@@ -2353,7 +2554,7 @@ async def ingest_undo_endpoint(
 @search_limit
 async def recall_endpoint(
     request: Request,
-    body: SearchRequest,
+    body: RecallRequest,
     response: Response,
     auth: AuthContext = Depends(get_auth_context),
 ):
@@ -2450,7 +2651,7 @@ async def recall_endpoint(
     # idempotent, so it's a no-op there.
 
     # ── Phase 2: LLM brief (no DB held) ──────────────────────────
-    return await summarize_memories(
+    brief = await summarize_memories(
         memories,
         body.query,
         config,
@@ -2459,7 +2660,18 @@ async def recall_endpoint(
         diagnostic_ctx=diagnostic_ctx,
         top_k=body.top_k,
         t0=t0,
+        items_alias=body.items_alias,
     )
+    # ax-0917-h-05 — same A28 channel /search uses, and the reason this route
+    # needed it most: ``limit`` is now an alias of ``top_k`` (schemas.py), but
+    # the NEXT plausible guess an agent makes still has to arrive as something
+    # other than silence. Added only when non-empty: unlike ``SearchResponse``
+    # this envelope is a plain dict, so an always-present ``"warnings": null``
+    # would be new bytes on every recall for the case where there is nothing
+    # to say — the opposite of what this PR is for.
+    if warnings := _unknown_param_warnings(body, route="memory-recall"):
+        brief["warnings"] = warnings
+    return brief
 
 
 # ---------------------------------------------------------------------------
