@@ -56,6 +56,13 @@ DEFAULT_SETTINGS: dict = {
         "provider": None,
         "model": None,
         "enabled": None,
+        # pm-0918-c-04. MUST be listed here, not only as a ResolvedConfig
+        # property: ``_check_keys`` validates a settings write against this
+        # schema, so a knob absent from it is READ-ONLY — the resolver returns
+        # its default and every attempt to set it raises "Unknown settings
+        # key(s)". A switch nobody can switch is worse than no switch, because
+        # it reads as shipped.
+        "atomic_fact_fanout_enabled": None,
     },
     "recall": {
         "provider": None,
@@ -632,6 +639,7 @@ def _check_keys(payload: dict, schema: dict, path: str = "") -> None:
 # Expected Python types for leaf values that need validation beyond key presence.
 # Dotted paths match the nested structure in DEFAULT_SETTINGS.
 _LEAF_TYPES: dict[str, type | tuple[type, ...]] = {
+    "enrichment.atomic_fact_fanout_enabled": bool,
     "security_audit.schedule_enabled": bool,
     "security_audit.schedule_cron": str,
     "security_audit.alerts_enabled": bool,
@@ -1065,6 +1073,40 @@ class ResolvedConfig:
         if val is None:
             return CRYSTALLIZER_MIN_CLUSTER_SIZE
         return max(2, int(val))
+
+    @property
+    def atomic_fact_fanout_enabled(self) -> bool:
+        """Create a child memory per extracted atomic fact (default ON).
+
+        A70 shipped this on the strength of a measurement that it almost never
+        fires, taken on conversational content. pm-0918-c-04 asked whether it
+        should be gated off for document-shaped writes, on the theory that
+        2,000-character chunks are the shape it fires on.
+
+        That question is still OPEN. The attempt to settle it against the local
+        corpus failed for reasons worth knowing before anyone tries again: every
+        fan-out child in that database came from benchmark conversation data,
+        the non-benchmark slice produced none at all, and the corpus predates
+        A70 — so it contains no worker-path fan-out, and pre-A70 deferred writes
+        discarded their facts, which reads as "did not fan out". See
+        docs/atomic-fact-fanout/pm-c04-fanout-rate-findings.md.
+
+        So this is a switch and not a threshold, because there is no evidence
+        for where a threshold would go — not because the evidence rules one out.
+
+        A switch is worth having regardless of how that question lands: a tenant
+        whose results are crowded by fan-out children turns them off for its own
+        store, immediately, without a deploy and without inheriting a number
+        somebody guessed. Default ON is today's behaviour; changing every
+        tenant's store to address one store's regression would be the wrong
+        default whichever way the measurement eventually goes.
+
+        Off is cheaper but not free of consequence: it skips the children's
+        embeddings and writes, NOT the enrichment call that extracted the facts
+        — that has already happened by the time this is read.
+        """
+        val = self._ts.get("enrichment", {}).get("atomic_fact_fanout_enabled")
+        return val if val is not None else True
 
     # Dedup
     @property

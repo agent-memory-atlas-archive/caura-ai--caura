@@ -3176,6 +3176,25 @@ async def fan_out_atomic_facts(
     """
     if not atomic_facts:
         return {"created": 0, "deduped": 0, "unembedded": 0}
+    # pm-0918-c-04. Gated HERE rather than at either call site: this function is
+    # shared precisely so the synchronous and worker paths cannot drift, and a
+    # switch honoured by only one of them would be a per-write-mode difference
+    # that nobody asked for. ``getattr`` because older config objects and test
+    # doubles predate the knob, matching how ``crystallizer_min_cluster_size``
+    # is read in ``_run_crystallization``.
+    #
+    # Returns zeroed counts rather than raising so the worker path reaches its
+    # ``atomic_facts`` marker cleanup: the consumer preserves the marker on an
+    # exception (for a later retry) and clears it otherwise. Raising would not
+    # loop forever — the consumer catches and returns without nacking — but it
+    # would leave the marker set on every disabled-tenant write, so each
+    # redelivery re-enters a fan-out that is switched off.
+    #
+    # The trade this makes: clearing the marker CONSUMES those facts. Switching
+    # the fan-out back on later will not replay them without re-enrichment. That
+    # is right for "disable", and worth knowing if anyone reads it as "pause".
+    if not getattr(tenant_config, "atomic_fact_fanout_enabled", True):
+        return {"created": 0, "deduped": 0, "unembedded": 0}
     meta = parent_metadata
     fanout_created = 0
     fanout_unembedded = 0
