@@ -9,16 +9,18 @@ swap.
 The 8 checks (one ``ScanFinding`` per hit; severity drives caller
 behavior — see :class:`ScanFinding`):
 
-  1. **prompt-injection** markers in content / description / summary /
-     evidence (``critical``) — quarantine.
-  2. **shell-injection** patterns inside ``support_files`` entries
-     whose ``role`` looks like a script (``critical``) — quarantine.
-  3. **URL exfiltration** patterns in the same script bodies
+  1. **prompt-injection** markers in name / content / description /
+     summary / goal / tags[] / evidence (``critical``) — quarantine.
+  2. **shell-injection** patterns inside ``support_files`` entry
+     bodies, under EVERY ``role`` (``critical``) — quarantine.
+  3. **URL exfiltration** patterns in script-roled bodies only
      (``warn``) — surfaces on the inbox card; doc may still proceed.
   4. **path violations** on ``support_files`` (absolute, traversal,
-     hidden, executable, non-UTF8) — ``fatal=True``; refuse the write.
-  5. **PII** (SSN / credit card / phone / email) in content / evidence
-     (``warn``; redact-on-display flag set by the inbox renderer).
+     hidden, bare-dot, executable, non-ASCII) — ``fatal=True``;
+     refuse the write.
+  5. **PII** (SSN / credit card / phone / email) in the same fields as
+     check #1 (``warn``; redact-on-display flag set by the inbox
+     renderer).
   6. **memory-id stuffing** — more than 20 unique cited memory ids in
      ``data.cites`` (the field Forge writes) or ``data.evidence.memory_ids``
      (the dict shape an external writer may use); ``warn``, capped at 20 on
@@ -27,6 +29,36 @@ behavior — see :class:`ScanFinding`):
      ``body_max_bytes`` — ``fatal=True``.
   8. **description size** — UTF-8 byte length of ``data.description``
      exceeds ``description_max_bytes`` — ``fatal=True``.
+
+``support_files`` (checks #2, #3, #4) has no production WRITER yet
+─────────────────────────────────────────────────────────────────
+09/02 L-01. Nothing in the shipped product populates the key.
+``forge_service._distill_cluster`` — the only production writer of a
+skill doc — builds ``data`` without it, and the only harness-install
+path that exists (the plugin's skill reconciler) materialises
+``<slug>/SKILL.md`` from ``data.content`` alone and never asks for
+side-car files. The identically-named ``support_files`` documented in
+``routes/documents.py`` belongs to the ``skills_rollback`` collection,
+carries a different shape
+(``{path, existed, previous_content_hash, previous_content}``), and is
+never handed to this scanner.
+
+So these three checks are FORWARD-LOOKING, not dead, and the
+distinction is the whole point. Contrast check #6 (09/02 L-35), which
+was repointed because a real, populated field — ``data.cites`` — was
+going unscanned while the check watched a shape no writer produced.
+There is no such alternate field here: no side-car content reaches
+disk by any route, so nothing is slipping past an unfired check.
+
+They are also reachable TODAY. ``POST /documents`` with
+``collection='skills'`` type-checks a fixed set of keys and passes
+every other key in ``data`` through untouched, so an external writer
+using the shape above is scanned exactly as written — see
+``tests/test_l01_sentinel_support_files_forward_looking.py``, which
+pins that. What is absent is a consumer, not a caller. Deleting the
+checks would drop BOTH of this module's ``fatal=True`` content guards
+while the write surface still accepts the field, and they would have
+to be written again for the Phase-3 install path.
 
 Performance budget (plan §9): p95 < 500ms on a 40KB body — regex +
 path checks + classifiers, **NO LLM, NO network**. Cacheable by
@@ -198,8 +230,15 @@ _PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
-def _scan_prompt_injection(text: str | None, field_name: str) -> Iterable[ScanFinding]:
-    if not text:
+def _scan_prompt_injection(text: object, field_name: str) -> Iterable[ScanFinding]:
+    # Non-``str`` in, nothing out. The guard used to be a bare ``if not
+    # text``, which a non-empty non-string (a ``list``, say) passes —
+    # sending it straight into ``re.search``, which raises ``TypeError``
+    # and takes down a scanner this module promises will never be the
+    # thing that fails a write. Reachable for every field: Forge and the
+    # pre-apply rescan both hand Sentinel data that never went through
+    # the SF-002 validator.
+    if not isinstance(text, str) or not text:
         return
     for pat in _PROMPT_INJECTION_PATTERNS:
         m = pat.search(text)
@@ -215,11 +254,15 @@ def _scan_prompt_injection(text: str | None, field_name: str) -> Iterable[ScanFi
             return
 
 
-# ── Check #2 — shell-injection in script bodies ────────────────────
+# ── Check #2 — shell-injection in support_file bodies ──────────────
 #
-# Only fires on support_files whose ``role`` looks script-y (the
-# harness install ships scripts/* under that path). Skips
-# non-executable artefacts like README/templates/references.
+# Runs on EVERY support_file body regardless of ``role`` — see the
+# orchestrator, which deliberately dropped the role gate because a
+# fork-bomb shipped under role='templates' would otherwise have gone
+# unscanned. This comment used to claim the opposite ("only fires on
+# support_files whose role looks script-y"); ``_SCRIPT_ROLES`` is what
+# check #3 (URL exfiltration) and check #4 (executable-extension
+# placement) gate on, and it does not narrow this check.
 _SCRIPT_ROLES: frozenset[str] = frozenset({"scripts", "script", "exec", "command"})
 
 _SHELL_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -466,8 +509,9 @@ _PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def _scan_pii(text: str | None, field_name: str) -> Iterable[ScanFinding]:
-    if not text:
+def _scan_pii(text: object, field_name: str) -> Iterable[ScanFinding]:
+    # Same non-``str`` guard as ``_scan_prompt_injection`` — see there.
+    if not isinstance(text, str) or not text:
         return
     for kind, pat in _PII_PATTERNS:
         m = pat.search(text)
@@ -607,9 +651,35 @@ async def scan_skill_doc(
     findings: list[ScanFinding] = []
 
     # Checks #1 + #5 over the natural-language fields.
-    for field_name in ("content", "description", "summary", "goal"):
+    #
+    # 09/02 L-02: ``name`` was missing from this tuple. It is not a
+    # cosmetic omission — the plugin's skill reconciler synthesises the
+    # YAML frontmatter of ``<slug>/SKILL.md`` from ``data.name`` and
+    # ``data.description`` whenever the body has none of its own, so an
+    # injection marker in a skill's display NAME is written to the file
+    # the agent harness loads, having passed a scan that looked at its
+    # neighbour ``description`` and not at it. Forge takes ``name``
+    # straight from the LLM distill response with an ``isinstance(str)``
+    # check and nothing else.
+    for field_name in ("name", "content", "description", "summary", "goal"):
         findings.extend(_scan_prompt_injection(data.get(field_name), field_name))
         findings.extend(_scan_pii(data.get(field_name), field_name))
+
+    # ``tags`` is the other field the L-02 row named, and it cannot just
+    # join the tuple above: it is a ``list[str]``, not a string, so it
+    # needs per-element scanning to get a usable locator (a bare
+    # ``data.tags`` would send an operator hunting through the list).
+    # The non-``str`` guard now lives in the two scanners — a list
+    # reaching ``re.search`` raised ``TypeError`` — but elements are
+    # still filtered here so a mixed list scans the strings in it
+    # instead of being skipped wholesale.
+    tags = data.get("tags")
+    if isinstance(tags, list):
+        for i, tag in enumerate(tags):
+            if not isinstance(tag, str):
+                continue
+            findings.extend(_scan_prompt_injection(tag, f"tags[{i}]"))
+            findings.extend(_scan_pii(tag, f"tags[{i}]"))
 
     evidence = data.get("evidence")
     if isinstance(evidence, str):
